@@ -1,0 +1,25 @@
+{
+  "name": "excel-to-csv-converter",
+  "version": "1.0.0",
+  "description": "Convertidor de Excel a CSV con corrección de formatos de fecha",
+  "main": "convertir-excel-csv.js",
+  "scripts": {
+    "convert": "node convertir-excel-csv.js",
+    "convert-mejorado": "node convertir-excel-csv-mejorado.js",
+    "import": "node importar-a-supabase.js",
+    "dev": "node app.js",
+    "start": "node app.js",
+    "build": "echo 'No build step required'"
+  },
+  "dependencies": {
+    "xlsx": "^0.18.5",
+    "@supabase/supabase-js": "^2.39.0",
+    "iconv-lite": "^0.6.3",
+    "express": "^4.18.2",
+    "express-session": "^1.17.3",
+    "bcrypt": "^5.1.1"
+  },
+  "keywords": ["excel", "csv", "converter", "fecha"],
+  "author": "Marcelo Olea",
+  "license": "MIT"
+}
