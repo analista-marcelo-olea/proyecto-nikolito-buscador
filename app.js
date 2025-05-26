@@ -1,7 +1,6 @@
 const express = require('express');
-const session = require('express-session');
-const bcrypt = require('bcrypt');
-const path = require('path');
+const jwt = require('jsonwebtoken');
+const cookieParser = require('cookie-parser');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
@@ -16,26 +15,41 @@ const supabase = createClient(supabaseUrl, supabaseKey);
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 app.use(express.static('public'));
+app.use(cookieParser());
 
-// Configuración de sesiones
-app.use(session({
-    secret: process.env.SESSION_SECRET || 'tu-secreto-super-seguro-aqui-cambiar-en-produccion',
-    resave: false,
-    saveUninitialized: false,
-    cookie: {
-        secure: process.env.NODE_ENV === 'production', // HTTPS en producción
-        maxAge: 24 * 60 * 60 * 1000, // 24 horas
-        httpOnly: true, // Seguridad adicional
+// Funciones JWT para Vercel
+function generateToken(userId) {
+    return jwt.sign({ userId }, process.env.SESSION_SECRET || 'tu-secreto-super-seguro-aqui-cambiar-en-produccion', { expiresIn: '24h' });
+}
+
+function verifyToken(token) {
+    try {
+        return jwt.verify(token, process.env.SESSION_SECRET || 'tu-secreto-super-seguro-aqui-cambiar-en-produccion');
+    } catch (error) {
+        return null;
     }
-}));
+}
 
-// Middleware para verificar autenticación
+// Middleware para verificar autenticación (solo JWT para Vercel)
 function requireAuth(req, res, next) {
-    if (req.session.userId) {
-        next();
-    } else {
-        res.redirect('/login');
+    console.log(`🔐 Verificando autenticación para: ${req.path}`);
+    
+    // Solo usar JWT token en cookies
+    const token = req.cookies['nikolito-token'];
+    console.log(`🍪 Token encontrado: ${token ? 'SÍ' : 'NO'}`);
+    
+    if (token) {
+        const decoded = verifyToken(token);
+        console.log(`🔓 Token válido: ${decoded ? 'SÍ' : 'NO'}`);
+        if (decoded) {
+            req.userId = decoded.userId;
+            console.log(`✅ Usuario autenticado ID: ${decoded.userId}`);
+            return next();
+        }
     }
+
+    console.log(`❌ Redirigiendo a login desde: ${req.path}`);
+    res.redirect('/login');
 }
 
 // Función para verificar intentos de login
@@ -65,9 +79,8 @@ async function verificarIntentos(usuario) {
     return { bloqueado: false, intentos: data.intentos_fallidos };
 }
 
-// Función para incrementar intentos fallidos (funciona aunque el usuario no exista)
+// Función para incrementar intentos fallidos
 async function incrementarIntentos(usuario) {
-    // Primero intentar obtener el registro de intentos
     const { data } = await supabase
         .from('intentos_login')
         .select('intentos_fallidos')
@@ -116,7 +129,9 @@ async function resetearIntentos(usuario) {
 
 // Rutas
 app.get('/', (req, res) => {
-    if (req.session.userId) {
+    // Verificar JWT token
+    const token = req.cookies['nikolito-token'];
+    if (token && verifyToken(token)) {
         res.redirect('/dashboard');
     } else {
         res.redirect('/login');
@@ -124,7 +139,9 @@ app.get('/', (req, res) => {
 });
 
 app.get('/login', (req, res) => {
-    if (req.session.userId) {
+    // Verificar JWT token
+    const token = req.cookies['nikolito-token'];
+    if (token && verifyToken(token)) {
         res.redirect('/dashboard');
         return;
     }
@@ -186,19 +203,20 @@ app.get('/login', (req, res) => {
     `);
 });
 
+
 app.post('/login', async (req, res) => {
     const { usuario, password } = req.body;
 
     try {
         // Verificar intentos de login
-        const { bloqueado, intentos } = await verificarIntentos(usuario);
+        const { bloqueado } = await verificarIntentos(usuario);
 
         if (bloqueado) {
             return res.redirect('/login?error=Usuario bloqueado por 1 minuto debido a múltiples intentos fallidos');
         }
 
         // Buscar usuario en la base de datos
-        const { data: userData, error } = await supabase
+        const { data: userData } = await supabase
             .from('usuarios')
             .select('id, usuario, password_hash, activo')
             .eq('usuario', usuario)
@@ -224,8 +242,21 @@ app.post('/login', async (req, res) => {
 
         // Login exitoso
         await resetearIntentos(usuario);
-        req.session.userId = userData.id;
-        req.session.usuario = userData.usuario;
+        console.log(`✅ Login exitoso para usuario: ${usuario}`);
+
+        // Crear JWT token para Vercel (sin sesiones)
+        const jwtToken = generateToken(userData.id);
+        console.log(`🔑 JWT token generado para usuario ID: ${userData.id}`);
+
+        // Configurar cookie con JWT (optimizado para Vercel)
+        res.cookie('nikolito-token', jwtToken, {
+            httpOnly: true,
+            secure: true, // Siempre true para Vercel (HTTPS)
+            maxAge: 24 * 60 * 60 * 1000, // 24 horas
+            sameSite: 'lax', // CRÍTICO: Cambiado de 'none' a 'lax' para Vercel
+            path: '/' // Asegurar que esté disponible en toda la app
+        });
+        console.log(`🍪 Cookie JWT configurada para usuario: ${usuario}`);
 
         // Crear sesión en la base de datos
         const sessionToken = Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
@@ -239,6 +270,7 @@ app.post('/login', async (req, res) => {
                 expires_at: expiresAt
             });
 
+        console.log(`🚀 Redirigiendo a dashboard para usuario: ${usuario}`);
         res.redirect('/dashboard');
 
     } catch (error) {
@@ -247,7 +279,26 @@ app.post('/login', async (req, res) => {
     }
 });
 
-app.get('/dashboard', requireAuth, (req, res) => {
+
+app.get('/dashboard', requireAuth, async (req, res) => {
+    // Obtener el nombre de usuario desde JWT
+    let usuario = 'Usuario';
+    if (req.userId) {
+        // Buscar el usuario en la base de datos usando el ID del JWT
+        try {
+            const { data: userData } = await supabase
+                .from('usuarios')
+                .select('usuario')
+                .eq('id', req.userId)
+                .single();
+            if (userData) {
+                usuario = userData.usuario;
+            }
+        } catch (error) {
+            console.error('Error obteniendo usuario:', error);
+        }
+    }
+
     res.send(`
         <!DOCTYPE html>
         <html lang="es">
@@ -306,7 +357,7 @@ app.get('/dashboard', requireAuth, (req, res) => {
         <body>
             <div class="container">
                 <div class="header">
-                    <h1 class="welcome">👋 Bienvenido, ${req.session.usuario}!</h1>
+                    <h1 class="welcome">👋 Bienvenido, ${usuario}!</h1>
                     <a href="/logout" class="logout-btn">Cerrar Sesión</a>
                 </div>
 
@@ -355,123 +406,118 @@ app.get('/dashboard', requireAuth, (req, res) => {
                     </div>
                 </div>
 
-                <script>
-                    document.getElementById('searchForm').addEventListener('submit', async function(e) {
-                        e.preventDefault();
+            </div>
 
-                        const searchValue = document.getElementById('searchValue').value.trim();
-                        const searchField = document.getElementById('searchField').value;
-                        const resultsDiv = document.getElementById('searchResults');
+            <script>
+                document.getElementById('searchForm').addEventListener('submit', async function(e) {
+                    e.preventDefault();
 
-                        if (!searchValue) {
-                            resultsDiv.innerHTML = '<p style="color: #dc3545;">Por favor ingresa un valor para buscar.</p>';
+                    const valor = document.getElementById('searchValue').value.trim();
+                    const campo = document.getElementById('searchField').value;
+
+                    if (!valor) {
+                        alert('Por favor ingresa un valor para buscar');
+                        return;
+                    }
+
+                    const resultsDiv = document.getElementById('searchResults');
+                    resultsDiv.innerHTML = '<p>🔍 Buscando...</p>';
+
+                    try {
+                        const response = await fetch('/api/buscar', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                            },
+                            body: JSON.stringify({ valor, campo })
+                        });
+
+                        const data = await response.json();
+
+                        if (data.error) {
+                            resultsDiv.innerHTML = '<p style="color: red;">❌ Error: ' + data.error + '</p>';
                             return;
                         }
 
-                        resultsDiv.innerHTML = '<p style="color: #007bff;">🔍 Buscando...</p>';
+                        if (data.resultados.length === 0) {
+                            resultsDiv.innerHTML = '<p style="color: orange;">⚠️ No se encontraron resultados para "' + valor + '" en ' + campo + '</p>';
+                            return;
+                        }
 
-                        try {
-                            const response = await fetch('/api/buscar', {
-                                method: 'POST',
-                                headers: {
-                                    'Content-Type': 'application/json',
-                                },
-                                body: JSON.stringify({
-                                    valor: searchValue,
-                                    campo: searchField
-                                })
+                        // Si hay exactamente 1 resultado, mostrar transpuesto
+                        if (data.resultados.length === 1) {
+                            const registro = data.resultados[0];
+                            let html = '<h3>✅ Resultado encontrado (1 registro)</h3>';
+                            html += '<div class="table-container">';
+                            html += '<table style="width: 100%; border-collapse: collapse; background: white;">';
+
+                            Object.keys(registro).forEach(key => {
+                                const valor = registro[key] || '';
+                                html += '<tr style="border-bottom: 1px solid #ddd;">';
+                                html += '<td style="padding: 8px; font-weight: bold; background: #f8f9fa; width: 200px;">' + key.toUpperCase() + '</td>';
+                                html += '<td style="padding: 8px;">' + valor + '</td>';
+                                html += '</tr>';
                             });
 
-                            const data = await response.json();
-
-                            if (data.error) {
-                                resultsDiv.innerHTML = \`<p style="color: #dc3545;">❌ Error: \${data.error}</p>\`;
-                                return;
-                            }
-
-                            if (data.resultados.length === 0) {
-                                resultsDiv.innerHTML = '<p style="color: #ffc107;">⚠️ No se encontró ningún resultado.</p>';
-                                return;
-                            }
-
-                            let html = \`<h3 style="color: #28a745;">✅ Se encontraron \${data.resultados.length} resultado(s):</h3>\`;
-
-                            // Si hay exactamente 1 resultado, mostrar tabla transpuesta
-                            if (data.resultados.length === 1) {
-                                const row = data.resultados[0];
-                                html += '<div style="overflow-x: auto; -webkit-overflow-scrolling: touch; border: 1px solid #ddd; border-radius: 5px;"><table style="width: 100%; border-collapse: collapse; margin-top: 10px;">';
-                                html += '<thead><tr style="background-color: #f8f9fa;">';
-                                html += '<th style="border: 1px solid #ddd; padding: 8px; text-align: left; width: 200px;">Campo</th>';
-                                html += '<th style="border: 1px solid #ddd; padding: 8px; text-align: left;">Valor</th>';
-                                html += '</tr></thead><tbody>';
-
-                                // Mostrar cada campo como una fila
-                                Object.keys(row).forEach(key => {
-                                    if (key !== 'id' && key !== 'created_at') { // Omitir campos internos
-                                        const valor = row[key] || '';
-                                        const nombreCampo = key.toUpperCase().replace(/_/g, ' ');
-                                        html += '<tr>';
-                                        html += \`<td style="border: 1px solid #ddd; padding: 8px; font-weight: bold; background-color: #f8f9fa;">\${nombreCampo}</td>\`;
-                                        html += \`<td style="border: 1px solid #ddd; padding: 8px;">\${valor}</td>\`;
-                                        html += '</tr>';
-                                    }
-                                });
-
-                                html += '</tbody></table></div>';
-                            } else {
-                                // Tabla normal con todas las columnas para múltiples resultados
-                                html += '<div style="overflow-x: auto; -webkit-overflow-scrolling: touch; border: 1px solid #ddd; border-radius: 5px; position: relative;">';
-                                html += '<div style="background-color: #e3f2fd; padding: 8px; font-size: 12px; color: #1976d2; border-bottom: 1px solid #ddd;">📱 Desliza horizontalmente para ver todas las columnas</div>';
-                                html += '<table style="width: 100%; border-collapse: collapse; font-size: 12px; min-width: 800px;">';
-                                html += '<thead><tr style="background-color: #f8f9fa;">';
-
-                                // Obtener todas las columnas del primer resultado (excluyendo campos internos)
-                                const columnas = Object.keys(data.resultados[0]).filter(key => key !== 'id' && key !== 'created_at');
-                                columnas.forEach(col => {
-                                    const nombreCol = col.toUpperCase().replace(/_/g, ' ');
-                                    html += \`<th style="border: 1px solid #ddd; padding: 6px; text-align: left; min-width: 100px;">\${nombreCol}</th>\`;
-                                });
-
-                                html += '</tr></thead><tbody>';
-
-                                data.resultados.forEach(row => {
-                                    html += '<tr>';
-                                    columnas.forEach(col => {
-                                        const valor = row[col] || '';
-                                        html += \`<td style="border: 1px solid #ddd; padding: 6px;">\${valor}</td>\`;
-                                    });
-                                    html += '</tr>';
-                                });
-
-                                html += '</tbody></table></div>';
-                            }
+                            html += '</table></div>';
                             resultsDiv.innerHTML = html;
+                        } else {
+                            // Múltiples resultados - tabla normal
+                            let html = '<h3>✅ Resultados encontrados (' + data.resultados.length + ' registros)</h3>';
+                            html += '<div class="table-container">';
+                            html += '<table style="width: 100%; border-collapse: collapse; background: white; min-width: 800px;">';
 
-                        } catch (error) {
-                            resultsDiv.innerHTML = \`<p style="color: #dc3545;">❌ Error de conexión: \${error.message}</p>\`;
+                            // Encabezados
+                            html += '<thead><tr style="background: #007bff; color: white;">';
+                            Object.keys(data.resultados[0]).forEach(key => {
+                                html += '<th style="padding: 10px; text-align: left; white-space: nowrap;">' + key.toUpperCase() + '</th>';
+                            });
+                            html += '</tr></thead>';
+
+                            // Filas
+                            html += '<tbody>';
+                            data.resultados.forEach((registro, index) => {
+                                html += '<tr style="' + (index % 2 === 0 ? 'background: #f8f9fa;' : '') + '">';
+                                Object.values(registro).forEach(valor => {
+                                    html += '<td style="padding: 8px; border-bottom: 1px solid #ddd; white-space: nowrap;">' + (valor || '') + '</td>';
+                                });
+                                html += '</tr>';
+                            });
+                            html += '</tbody></table></div>';
+
+                            resultsDiv.innerHTML = html;
                         }
-                    });
 
-                    document.getElementById('clearBtn').addEventListener('click', function() {
-                        document.getElementById('searchValue').value = '';
-                        document.getElementById('searchField').value = 'direccion';
-                        document.getElementById('searchResults').innerHTML = '<p style="color: #666; font-style: italic;">Ingresa un valor y selecciona el campo para buscar.</p>';
-                        document.getElementById('searchValue').focus();
-                    });
-                </script>
-            </div>
+                    } catch (error) {
+                        console.error('Error:', error);
+                        resultsDiv.innerHTML = '<p style="color: red;">❌ Error de conexión</p>';
+                    }
+                });
+
+                document.getElementById('clearBtn').addEventListener('click', function() {
+                    document.getElementById('searchValue').value = '';
+                    document.getElementById('searchField').value = 'direccion';
+                    document.getElementById('searchResults').innerHTML = '<p style="color: #666; font-style: italic;">Ingresa un valor y selecciona el campo para buscar.</p>';
+                    document.getElementById('searchValue').focus();
+                });
+            </script>
         </body>
         </html>
     `);
 });
 
+
 app.get('/logout', (req, res) => {
-    req.session.destroy((err) => {
-        if (err) {
-            console.error('Error al cerrar sesión:', err);
-        }
-        res.redirect('/login');
+    // Limpiar cookie JWT (con mismas opciones que al crearla)
+    res.clearCookie('nikolito-token', {
+        httpOnly: true,
+        secure: true,
+        sameSite: 'lax', // CRÍTICO: Debe coincidir con la configuración
+        path: '/'
     });
+
+    // Redirigir al login (sin sesiones)
+    res.redirect('/login');
 });
 
 // API endpoint para búsquedas
@@ -490,7 +536,13 @@ app.post('/api/buscar', requireAuth, async (req, res) => {
             return res.status(400).json({ error: 'Campo no válido' });
         }
 
-        console.log(`🔍 Búsqueda: "${valor}" en campo "${campo}" por usuario ${req.session.usuario}`);
+        // Obtener usuario para logs
+        let usuarioLog = 'Usuario';
+        if (req.userId) {
+            usuarioLog = `ID:${req.userId}`;
+        }
+
+        console.log(`🔍 Búsqueda: "${valor}" en campo "${campo}" por usuario ${usuarioLog}`);
 
         let query = supabase
             .from('reporte_fnl')
@@ -538,4 +590,6 @@ app.listen(PORT, () => {
     console.log('📊 Base de datos conectada a Supabase');
     console.log('👤 Usuarios disponibles: admin, marcelo, test');
     console.log('🔑 Contraseñas: admin123, marcelo123, test123');
+    console.log('🔧 Modo: Solo JWT (sin sesiones en memoria)');
+    console.log('🍪 Cookie sameSite: lax (optimizado para Vercel)');
 });
